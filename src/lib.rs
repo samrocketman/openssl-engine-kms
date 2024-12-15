@@ -7,6 +7,8 @@ use rusoto_kms::{Kms, KmsClient};
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
 
 #[macro_use]
 extern crate lazy_static;
@@ -118,7 +120,7 @@ extern "C" {
         e: ENGINE,
         loadpub_f: extern "C" fn(ENGINE, *const c_char, *mut c_void, *mut c_void) -> EVP_PKEY,
     ) -> c_int;
-    fn EVP_PKEY_base_id(pkey: EVP_PKEY) -> c_int;
+    fn EVP_PKEY_get_base_id(pkey: EVP_PKEY) -> c_int;
     fn EVP_PKEY_set1_engine(pkey: EVP_PKEY, e: ENGINE) -> c_int;
     fn EVP_PKEY_meth_new(id: c_int, flags: c_int) -> EVP_PKEY_METHOD;
     fn EVP_PKEY_meth_copy(dst: EVP_PKEY_METHOD, src: EVP_PKEY_METHOD);
@@ -129,7 +131,7 @@ extern "C" {
     fn EVP_PKEY_meth_set_verify(pmeth: EVP_PKEY_METHOD, verify_init: pkey_init_fn, verify: pkey_verify_fn);
     fn EVP_PKEY_CTX_get0_pkey(ctx: EVP_PKEY_CTX) -> EVP_PKEY;
     fn EVP_PKEY_CTX_ctrl(ctx: EVP_PKEY_CTX, keytype: c_int, optype: c_int, cmd: c_int, p1: c_int, p2: *mut c_void) -> c_int;
-    fn EVP_MD_type(md: EVP_MD) -> c_int;
+    fn EVP_MD_get_type(md: EVP_MD) -> c_int;
     fn BIO_new_mem_buf(buf: *const c_void, len: c_int) -> BIO;
     fn BIO_free(a: BIO) -> c_int;
     fn d2i_PUBKEY_bio(bp: BIO, a: *mut EVP_PKEY) -> EVP_PKEY;
@@ -149,15 +151,19 @@ static RAND_METH: rand_meth_st = rand_meth_st {
 };
 
 lazy_static! {
-    static ref KMS_CLIENT: KmsClient = KmsClient::new(Region::EuWest1);
+    static ref KMS_CLIENT: KmsClient = KmsClient::new(Region::default());
     static ref KEYS: Mutex<HashMap<usize, String>> = Mutex::new(HashMap::new());
+}
+
+fn run_sync<T>(f: Pin<Box<dyn Future<Output=T>>>) -> T {
+    tokio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
 // implementation functions
 unsafe fn get_alg(ctx: EVP_PKEY_CTX) -> Result<&'static str, String> {
     let mut padding: c_int = 0;
     let mut md: EVP_MD = ptr::null_mut();
-    let key_type = EVP_PKEY_base_id(EVP_PKEY_CTX_get0_pkey(ctx));
+    let key_type = EVP_PKEY_get_base_id(EVP_PKEY_CTX_get0_pkey(ctx));
     if key_type == EVP_PKEY_RSA {
         EVP_PKEY_CTX_ctrl(ctx, -1, -1, EVP_PKEY_CTRL_GET_RSA_PADDING, 0, &mut padding as *mut _ as *mut c_void);
     }
@@ -170,7 +176,7 @@ unsafe fn get_alg(ctx: EVP_PKEY_CTX) -> Result<&'static str, String> {
     if md.is_null() {
         return Err("could not get md from pkey".to_string());
     }
-    let md_type = EVP_MD_type(md);
+    let md_type = EVP_MD_get_type(md);
     match (key_type, padding, md_type) {
         (EVP_PKEY_RSA, RSA_PKCS1_PADDING, NID_sha256) => Ok("RSASSA_PKCS1_V1_5_SHA_256"),
         (EVP_PKEY_RSA, RSA_PKCS1_PADDING, NID_sha384) => Ok("RSASSA_PKCS1_V1_5_SHA_384"),
@@ -208,7 +214,7 @@ extern "C" fn rand_bytes(buf: *mut c_uchar, num: c_int) -> c_int {
         custom_key_store_id: None,
         number_of_bytes: Some(num.into()),
     };
-    let output = KMS_CLIENT.generate_random(req).sync();
+    let output = run_sync(KMS_CLIENT.generate_random(req));
     if let Err(e) = output {
         error!("generate {} random bytes failed: {}", num, e);
         return 0;
@@ -244,7 +250,7 @@ extern "C" fn kms_sign(ctx: EVP_PKEY_CTX, sig: *mut c_uchar, siglen: *mut usize,
         signing_algorithm: alg.unwrap().to_string(),
         grant_tokens: None,
     };
-    let output = KMS_CLIENT.sign(req).sync();
+    let output = run_sync(KMS_CLIENT.sign(req));
     if let Err(e) = output {
         error!("sign err for key id {}: {}", key_id, e);
         return 0;
@@ -275,7 +281,7 @@ extern "C" fn kms_verify(ctx: EVP_PKEY_CTX, sig: *const c_uchar, siglen: usize, 
         signing_algorithm: alg.unwrap().to_string(),
         grant_tokens: None,
     };
-    let output = KMS_CLIENT.verify(req).sync();
+    let output = run_sync(KMS_CLIENT.verify(req));
     if let Err(e) = output {
         match e {
             rusoto_core::RusotoError::Unknown(x) if x.body_as_str().contains("KMSInvalidSignatureException") => {
@@ -305,7 +311,7 @@ extern "C" fn kms_encrypt(ctx: EVP_PKEY_CTX, out: *mut c_uchar, outlen: *mut usi
         encryption_context: None,
         grant_tokens: None,
     };
-    let output = KMS_CLIENT.encrypt(req).sync();
+    let output = run_sync(KMS_CLIENT.encrypt(req));
     if let Err(e) = output {
         error!("encrypt err for key id {}: {}", key_id, e);
         return 0;
@@ -334,7 +340,7 @@ extern "C" fn kms_decrypt(ctx: EVP_PKEY_CTX, out: *mut c_uchar, outlen: *mut usi
         encryption_context: None,
         grant_tokens: None,
     };
-    let output = KMS_CLIENT.decrypt(req).sync();
+    let output = run_sync(KMS_CLIENT.decrypt(req));
     if let Err(e) = output {
         error!("decrypt err for key id {}: {}", key_id, e);
         return 0;
@@ -374,7 +380,8 @@ extern "C" fn load_key(e: ENGINE, key_id: *const c_char, _ui_method: *mut c_void
         key_id: key_id.to_string(),
         grant_tokens: None,
     };
-    let output = KMS_CLIENT.get_public_key(req).sync();
+    let output = run_sync(KMS_CLIENT.get_public_key(req));
+    // let output = KMS_CLIENT.get_public_key(req).sync();
     if let Err(e) = output {
         error!("load key err for key id {}: {}", key_id, e);
         return ptr::null_mut();
